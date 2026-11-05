@@ -1,0 +1,2 @@
+python dlinear_test.py --csv test_data.csv --column traffic --sweep
+python dlinear_test.py --csv test_data.csv --column price --sweep
