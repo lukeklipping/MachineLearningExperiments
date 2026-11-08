@@ -1,2 +1,3 @@
-python dlinear_test.py --csv test_data.csv --column traffic --sweep
-python dlinear_test.py --csv test_data.csv --column price --sweep
+python dlinear/dlinear_test.py --csv test_data.csv --column traffic --sweep
+python dlinear/dlinear_test.py --csv test_data.csv --column price --sweep
+python dlinear/dlinear_test.py --csv test_data.csv --column smooth --sweep
