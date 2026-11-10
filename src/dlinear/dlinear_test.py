@@ -1,23 +1,32 @@
 """
-Test DLinear on a univariate time series, optionally with lossy compression.
+Test DLinear on a univariate time series with real lossy compression.
+
+Needs compressors.py in the same folder.  pip install torch numpy pandas PyWavelets scipy
 
 Examples:
-  python dlinear_test.py                          # downloads ETTh1, column OT
+  python dlinear_test.py                                  # ETTh1, no compression
   python dlinear_test.py --csv my.csv --column value
-  python dlinear_test.py --quant-bits 4           # compress inputs to 16 levels
-  python dlinear_test.py --sweep                  # compare several bit depths
+  python dlinear_test.py --method wavelet --ratio 8       # one compressed run
+  python dlinear_test.py --method all --sweep             # every method x ratio
 
-Compression is applied to the INPUT series (what the model sees), while
-forecasts are always scored against the ORIGINAL, uncompressed values.
+How compression is applied:
+  Every input window (the history the model sees) is compressed and
+  reconstructed on its own. Forecast targets are never compressed, and all
+  scores compare forecasts against the ORIGINAL values.
 """
 import argparse
 import os
+import sys
+from pathlib import Path
 import urllib.request
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from compressors.compress import COMPRESSORS, compress_windows
 
 ETTH1_URL = ("https://raw.githubusercontent.com/zhouhaoyi/ETDataset/"
              "main/ETT-small/ETTh1.csv")
@@ -68,55 +77,46 @@ def load_series(csv_path, column):
     return df[column].astype(float).to_numpy()
 
 
-def quantize(x, bits):
-    """Lossy compression: uniform quantization to 2**bits levels.
-    Returns reconstructed series and the compression ratio vs 64-bit floats."""
-    lo, hi = x.min(), x.max()
-    levels = 2 ** bits - 1
-    codes = np.round((x - lo) / (hi - lo) * levels)
-    recon = codes / levels * (hi - lo) + lo
-    return recon, 64.0 / bits
+def make_windows(series, L, T):
+    """Sliding windows over one series: inputs X (n, L), targets Y (n, T)."""
+    n = len(series) - L - T + 1
+    X = np.stack([series[i:i + L] for i in range(n)])
+    Y = np.stack([series[i + L:i + L + T] for i in range(n)])
+    return X, Y
 
 
-def make_windows(inputs, targets, L, T):
-    """Sliding windows: X from `inputs`, Y from `targets`."""
-    n = len(inputs) - L - T + 1
-    X = np.stack([inputs[i:i + L] for i in range(n)])
-    Y = np.stack([targets[i + L:i + L + T] for i in range(n)])
-    return (torch.tensor(X, dtype=torch.float32),
-            torch.tensor(Y, dtype=torch.float32))
-
-
-# ---------------------------------------------------------------- metrics
-def mase(y_true, y_pred, y_train_naive_scale):
-    return np.mean(np.abs(y_true - y_pred)) / y_train_naive_scale
-
-
-# ---------------------------------------------------------------- run
-def run(raw, bits, args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
+def build_splits(raw, method, ratio, L, T):
+    """Standardize, window, and compress the INPUT windows of each split.
+    Returns ({split: (X, Y)}, effective compression ratio)."""
     n = len(raw)
     n_train, n_val = int(n * 0.7), int(n * 0.1)
 
     # Standardize using TRAIN statistics only (avoids leakage).
-    mean, std = raw[:n_train].mean(), raw[:n_train].std()
-    raw_s = (raw - mean) / std
+    raw_s = (raw - raw[:n_train].mean()) / raw[:n_train].std()
 
-    if bits is None:
-        inp_s, ratio = raw_s, 1.0
-    else:
-        inp_s, ratio = quantize(raw_s, bits)
+    # Windows overlap split borders by L so each split has full context.
+    bounds = {"train": (0, n_train),
+              "val": (n_train - L, n_train + n_val),
+              "test": (n_train + n_val - L, n)}
+    splits, eff_ratio = {}, 1.0
+    for name, (a, b) in bounds.items():
+        X, Y = make_windows(raw_s[a:b], L, T)
+        if method is not None:
+            X, eff_ratio = compress_windows(X, method, ratio)
+        splits[name] = (X.astype(np.float32), Y.astype(np.float32))
+    return splits, eff_ratio
+
+
+# ---------------------------------------------------------------- run
+def run(raw, method, ratio, args):
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     L, T = args.input_len, args.horizon
-    sl = lambda a, b: slice(a, b)
-    # Windows overlap split borders by L so each split has full context.
-    X_tr, Y_tr = make_windows(inp_s[sl(0, n_train)], raw_s[sl(0, n_train)], L, T)
-    X_va, Y_va = make_windows(inp_s[sl(n_train - L, n_train + n_val)],
-                              raw_s[sl(n_train - L, n_train + n_val)], L, T)
-    X_te, Y_te = make_windows(inp_s[sl(n_train + n_val - L, n)],
-                              raw_s[sl(n_train + n_val - L, n)], L, T)
+    splits, eff_ratio = build_splits(raw, method, ratio, L, T)
+    X_tr, Y_tr = (torch.from_numpy(a) for a in splits["train"])
+    X_va, Y_va = (torch.from_numpy(a) for a in splits["val"])
+    X_te, Y_te = (torch.from_numpy(a) for a in splits["test"])
 
     model = DLinear(L, T, args.kernel)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -149,19 +149,21 @@ def run(raw, bits, args):
         pred = model(X_te).numpy()
     true = Y_te.numpy()
 
-    # Naive baseline: repeat last observed (compressed) value.
+    # Naive baseline: repeat the last value of the (compressed) history.
     naive = np.repeat(X_te[:, -1:].numpy(), T, axis=1)
-    # MASE scale: mean abs one-step change of the raw training series.
-    scale = np.mean(np.abs(np.diff(raw_s[:n_train])))
+    mae = float(np.mean(np.abs(true - pred)))
+    naive_mae = float(np.mean(np.abs(true - naive)))
 
     return {
-        "bits": "none" if bits is None else bits,
-        "ratio": round(ratio, 1),
+        "method": method or "none",
+        "target": "-" if ratio is None else ratio,
+        "ratio": round(eff_ratio, 1),
         "epochs": epoch + 1,
         "MSE": float(np.mean((true - pred) ** 2)),
-        "MAE": float(np.mean(np.abs(true - pred))),
-        "MASE": float(mase(true, pred, scale)),
-        "naive_MAE": float(np.mean(np.abs(true - naive))),
+        "MAE": mae,
+        "naive_MAE": naive_mae,
+        # Model error / naive error. Below 1 beats "repeat last value".
+        "err_vs_naive": mae / naive_mae,
     }
 
 
@@ -177,18 +179,32 @@ def main():
     p.add_argument("--lr", type=float, default=0.005)
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--quant-bits", type=int, default=None)
+    p.add_argument("--method", default="wavelet",
+                   choices=list(COMPRESSORS) + ["all"])
+    p.add_argument("--ratio", type=float, default=None,
+                   help="target ratio: keep ~input_len/ratio values per window")
     p.add_argument("--sweep", action="store_true")
     args = p.parse_args()
 
     raw = load_series(args.csv, args.column)
     print(f"Series length: {len(raw)}")
 
-    settings = [None, 8, 6, 4, 3, 2] if args.sweep else [args.quant_bits]
-    rows = [run(raw, b, args) for b in settings]
+    methods = list(COMPRESSORS) if args.method == "all" else [args.method]
+    if args.sweep:
+        jobs = [(None, None)] + [(m, r) for m in methods for r in (2, 4, 8, 16, 32)]
+    elif args.ratio is None:
+        jobs = [(None, None)]
+    else:
+        jobs = [(m, args.ratio) for m in methods]
+
+    rows = []
+    for m, r in jobs:
+        print(f"running {m or 'none'} {r or ''} ...", flush=True)
+        rows.append(run(raw, m, r, args))
     print(pd.DataFrame(rows).to_string(index=False))
-    print("\nMetrics are in standardized units, scored vs ORIGINAL data. "
-          "MASE < 1 beats the naive one-step benchmark.")
+    print("\nratio = real storage ratio (includes coefficient positions); "
+          "target = requested.\nScores are in standardized units against the "
+          "ORIGINAL data; err_vs_naive < 1 beats repeat-last-value.")
 
 
 if __name__ == "__main__":
