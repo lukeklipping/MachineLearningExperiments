@@ -1,3 +1,6 @@
 python dlinear/dlinear_test.py --csv test_data.csv --column traffic --sweep
 python dlinear/dlinear_test.py --csv test_data.csv --column price --sweep
 python dlinear/dlinear_test.py --csv test_data.csv --column smooth --sweep
+
+
+python experiments/gboost/gbm_test.py --csv ../data/test_data.csv --column traffic --method all --sweep
